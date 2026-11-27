@@ -1,0 +1,9 @@
+{
+  "_comment": "NightMode settings. enabled: true or false. start/end: 24h local NAS time as \"HH:MM\"; the window may cross midnight. keep_on_group: name of the UniFi AP Group whose APs stay on at night (or a list of names). keep_on: optional extra AP names or MACs that stay on. ignore: APs the script never touches.",
+  "enabled": true,
+  "start": "23:00",
+  "end": "06:00",
+  "keep_on_group": "NightMode",
+  "keep_on": [],
+  "ignore": []
+}

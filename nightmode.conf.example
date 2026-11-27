@@ -1,0 +1,24 @@
+# NightMode local settings. Keep this file OUT of the shared folder and
+# readable only by the account that runs the task (chmod 600).
+# Format: KEY=VALUE, one per line. Values are read literally (never executed).
+
+# IP or hostname of the UniFi Dream Machine
+UNIFI_HOST=192.168.1.1
+
+# Dedicated LOCAL UniFi OS account (no 2FA, not a UI.com cloud account)
+UNIFI_USER=nightmode
+UNIFI_PASS=change-me
+
+# UniFi site name ("default" unless you created more sites)
+UNIFI_SITE=default
+
+# Optional: path to the UDM certificate (PEM) to verify TLS.
+# Empty = accept the UDM's self-signed certificate (curl -k).
+UNIFI_CACERT=
+
+# The shared JSON the others edit
+SHARED_CONFIG=/volume1/Shared/NightMode/nightmode.json
+
+# Log file (trimmed to the last LOG_MAX_LINES lines)
+LOG_FILE=/volume1/Shared/NightMode/nightmode.log
+LOG_MAX_LINES=2000

@@ -1,0 +1,4 @@
+# Local credentials, never commit
+nightmode.conf
+# Runtime log
+nightmode.log
