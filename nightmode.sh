@@ -126,10 +126,13 @@ trap 'exit 1' INT TERM HUP PIPE
 # ---------------------------------------------------------------------------
 # Minimal JSON flattener (awk). Input: JSON. Output lines: path<TAB>value
 # e.g. "enabled<TAB>true", "keep_on.0<TAB>AP-Office", "data.3.mac<TAB>aa:.."
-# Linear time: splits on quotes instead of scanning char by char.
+# The input is first cut at every double quote (tr), so awk only ever sees
+# short lines. This keeps it fast and avoids line/string size limits of some
+# awk versions (macOS awk failed on one 480 KB line). Raw newlines can only be
+# whitespace in valid JSON, so they are turned into spaces first.
 # ---------------------------------------------------------------------------
 json_flat() {
-    awk '
+    { tr '\r\n' '  '; echo; } | tr '"' '\n' | awk '
     function add(t, v) { ntok++; T[ntok] = t; V[ntok] = v }
     function lex(s,   i, c, lit, L) {
         L = length(s); lit = ""
@@ -176,21 +179,19 @@ json_flat() {
             print path "\t" V[pos]; pos++
         } else fail("unexpected token " T[pos])
     }
-    { buf_all = buf_all $0 "\n" }
+    # each input line is the text between two double quotes; lines
+    # alternate between outside-a-string and inside-a-string
+    {
+        if (!inside) { lex($0); inside = 1; open_str = 0 }
+        else {
+            open_str = 1
+            sbuf = sbuf $0
+            if (trailing_bs(sbuf) % 2 == 1) { sbuf = sbuf "\""; next }   # escaped quote
+            add("s", unesc(sbuf)); sbuf = ""; inside = 0; open_str = 0
+        }
+    }
     END {
         if (err) exit 1
-        n = split(buf_all, P, "\"")
-        inside = 0; sbuf = ""
-        for (i = 1; i <= n; i++) {
-            if (!inside) { lex(P[i]); inside = 1; open_str = 0 }
-            else {
-                open_str = 1
-                sbuf = sbuf P[i]
-                if (i == n) break
-                if (trailing_bs(sbuf) % 2 == 1) { sbuf = sbuf "\""; continue }
-                add("s", unesc(sbuf)); sbuf = ""; inside = 0; open_str = 0
-            }
-        }
         if (open_str) fail("unterminated string")
         pos = 1
         if (ntok == 0) fail("empty input")
