@@ -121,7 +121,7 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
     fi
 fi
 trap cleanup EXIT
-trap 'exit 1' INT TERM HUP
+trap 'exit 1' INT TERM HUP PIPE
 
 # ---------------------------------------------------------------------------
 # Minimal JSON flattener (awk). Input: JSON. Output lines: path<TAB>value
