@@ -2,21 +2,22 @@
 # =============================================================================
 # NightMode for UniFi (UDM / UniFi OS) - run on a Synology NAS
 #
-# During the night window defined in a shared JSON file, all UniFi access
-# points except the "keep_on" ones (or the members of "keep_on_group") are disabled. Outside the window (or when
-# NightMode is switched off) all APs are enabled again.
+# Turns UniFi access points off and on by schedule. The shared JSON file
+# gives each UniFi AP Group its own "off" time window (e.g. the evening group
+# off 22:00-06:00, the night group never off), plus a default window for all
+# APs that are in none of the listed groups (e.g. off 19:00-08:00).
 #
 # The script is idempotent: run it every 15 minutes from the DSM Task
 # Scheduler and it converges to the desired state, only changing APs whose
-# state differs. Needs only: sh, curl, awk, sed, grep (no jq, no python).
+# state differs. Needs only: sh, curl, awk, sed, grep, tr (no jq, no python).
 #
 # Usage:
 #   nightmode.sh [-c local.conf] [--dry-run] [--list] [--debug]
 #     -c FILE     local settings/credentials file (default: nightmode.conf
 #                 next to this script)
 #     --dry-run   show what would change, change nothing
-#     --list      print all APs (name, MAC, state) and exit; use this to fill
-#                 in "keep_on" in the shared JSON
+#     --list      print all APs (name, MAC, state) and all AP groups, then
+#                 exit; use it to get the group names for the shared JSON
 #     --debug     print HTTP status and the start of each controller response
 #                 to the terminal (passwords, keys and tokens are redacted)
 #
@@ -39,7 +40,7 @@ while [ $# -gt 0 ]; do
         --dry-run) DRY_RUN=1; shift ;;
         --list) LIST_ONLY=1; shift ;;
         --debug) DEBUG=1; shift ;;
-        -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+        -h|--help) sed -n "2,24p" "$0"; exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -299,51 +300,87 @@ in_window() {
 }
 
 # ---------------------------------------------------------------------------
-# 1) Read shared config and decide whether it is night
+# 1) Read the shared config into rules
+#
+#   $WORK/rules : rule-no<TAB>active(1 = should be off now)<TAB>description
+#   $WORK/rmatch: rule-no<TAB>group|ap<TAB>value
+#   rule 0 is the "default" rule for APs that are in none of the groups.
 # ---------------------------------------------------------------------------
-NIGHT=0
-REASON=""
-KEEP_LIST=""
-KEEP_GROUPS=""
+FAILSAFE=""          # non-empty: turn every AP on, with this reason
+DISABLED=0
 IGNORE_LIST=""
+RULES="$WORK/rules"; : > "$RULES"
+RMATCH="$WORK/rmatch"; : > "$RMATCH"
+TAB="$(printf '\t')"
+NOW_RAW=${NIGHTMODE_NOW:-$(date '+%H:%M')}
+NOW=$(to_minutes "$NOW_RAW")
+
+# rule_state OFF FROM UNTIL -> prints "active<TAB>description", fails if invalid
+rule_state() {
+    case "$(lower "$1")" in
+        never) printf '0\tnever off\n'; return 0 ;;
+        always) printf '1\talways off\n'; return 0 ;;
+        "") ;;
+        *) return 1 ;;
+    esac
+    _s=$(to_minutes "$2") || return 1
+    _e=$(to_minutes "$3") || return 1
+    [ -n "$_s" ] && [ -n "$_e" ] && [ "$_s" != "$_e" ] || return 1
+    if in_window "$_s" "$_e" "$NOW"; then _a=1; else _a=0; fi
+    printf '%s\toff %s-%s\n' "$_a" "$2" "$3"
+}
+
+add_rule() {
+    # $1 no, $2 label, $3 off, $4 from, $5 until
+    if ! _st=$(rule_state "$3" "$4" "$5"); then
+        FAILSAFE="invalid time in $2 (off_from=\"$4\" off_until=\"$5\" off=\"$3\"; use \"22:00\" or \"off\": \"never\")"
+        return 1
+    fi
+    printf '%s\t%s\t%s: %s\n' "$1" "${_st%%"$TAB"*}" "$2" "${_st#*"$TAB"}" >> "$RULES"
+}
 
 if [ "$LIST_ONLY" = 0 ]; then
     if [ ! -r "$SHARED_CONFIG" ]; then
-        REASON="shared config $SHARED_CONFIG not readable -> fail-safe: all APs on"
-        log WARN "$REASON"
+        FAILSAFE="shared config $SHARED_CONFIG not readable"
     elif ! tr -d '\r' < "$SHARED_CONFIG" | json_flat > "$WORK/cfg" 2>/dev/null || grep -q '^__error__' "$WORK/cfg"; then
-        REASON="shared config is not valid JSON ($(grep '^__error__' "$WORK/cfg" | cut -f2)) -> fail-safe: all APs on"
-        log WARN "$REASON"
+        FAILSAFE="shared config is not valid JSON ($(grep '^__error__' "$WORK/cfg" | cut -f2))"
+    elif [ "$(lower "$(json_get "$WORK/cfg" enabled)")" != "true" ]; then
+        DISABLED=1
     else
-        ENABLED=$(lower "$(json_get "$WORK/cfg" enabled)")
-        START_RAW=$(json_get "$WORK/cfg" start)
-        END_RAW=$(json_get "$WORK/cfg" end)
-        KEEP_LIST=$(json_list "$WORK/cfg" keep_on)
-        # keep_on_group may be a single name or a list of names
-        KEEP_GROUPS=$( { json_get "$WORK/cfg" keep_on_group; json_list "$WORK/cfg" keep_on_group; } | grep -v '^$')
         IGNORE_LIST=$(json_list "$WORK/cfg" ignore)
-
-        START=$(to_minutes "$START_RAW")
-        END=$(to_minutes "$END_RAW")
-        NOW_RAW=${NIGHTMODE_NOW:-$(date '+%H:%M')}
-        NOW=$(to_minutes "$NOW_RAW")
-
-        if [ "$ENABLED" != "true" ]; then
-            REASON="NightMode disabled in config"
-        elif [ -z "$START" ] || [ -z "$END" ]; then
-            REASON="invalid start/end in config (start=\"$START_RAW\" end=\"$END_RAW\", use \"23:00\") -> fail-safe: all APs on"
-            log WARN "$REASON"
-        elif [ "$START" = "$END" ]; then
-            REASON="start equals end ($START_RAW) -> no night window"
-            log WARN "$REASON"
-        elif [ -z "$KEEP_LIST" ] && [ -z "$KEEP_GROUPS" ]; then
-            REASON="keep_on and keep_on_group are empty -> refusing to turn off every AP, all APs on"
-            log WARN "$REASON"
-        elif in_window "$START" "$END" "$NOW"; then
-            NIGHT=1
-            REASON="night window $START_RAW-$END_RAW, now $NOW_RAW"
+        if [ -z "$NOW" ]; then
+            FAILSAFE="cannot read current time \"$NOW_RAW\""
+        elif grep -q -E '^(default|groups)(\.|	)' "$WORK/cfg"; then
+            # current format: "default" + "groups"
+            if grep -q '^default\.' "$WORK/cfg"; then
+                add_rule 0 "default" "$(json_get "$WORK/cfg" default.off)" \
+                    "$(json_get "$WORK/cfg" default.off_from)" "$(json_get "$WORK/cfg" default.off_until)"
+            else
+                printf '0\t0\tdefault: never off\n' >> "$RULES"
+            fi
+            for _n in $(awk -F '\t' '{ split($1, p, "."); if (p[1] == "groups" && p[2] ~ /^[0-9]+$/ && !s[p[2]]++) print p[2] }' "$WORK/cfg"); do
+                [ -n "$FAILSAFE" ] && break
+                _r=$((_n + 1))
+                _gl=$( { json_get "$WORK/cfg" "groups.$_n.group"; json_list "$WORK/cfg" "groups.$_n.group"; } | grep -v '^$')
+                _al=$(json_list "$WORK/cfg" "groups.$_n.aps")
+                if [ -z "$_gl" ] && [ -z "$_al" ]; then
+                    FAILSAFE="entry $_r in \"groups\" has neither \"group\" nor \"aps\""; break
+                fi
+                _label=$(printf '%s' "$_gl $_al" | tr '\n' ',' | sed 's/^ //; s/,$//; s/ $//')
+                add_rule "$_r" "$_label" "$(json_get "$WORK/cfg" "groups.$_n.off")" \
+                    "$(json_get "$WORK/cfg" "groups.$_n.off_from")" "$(json_get "$WORK/cfg" "groups.$_n.off_until")" || break
+                printf '%s\n' "$_gl" | while IFS= read -r _v; do [ -n "$_v" ] && printf '%s\tgroup\t%s\n' "$_r" "$_v"; done >> "$RMATCH"
+                printf '%s\n' "$_al" | while IFS= read -r _v; do [ -n "$_v" ] && printf '%s\tap\t%s\n' "$_r" "$_v"; done >> "$RMATCH"
+            done
+        elif [ -n "$(json_get "$WORK/cfg" start)" ]; then
+            # old format (start/end/keep_on_group/keep_on): still understood
+            add_rule 0 "default" "" "$(json_get "$WORK/cfg" start)" "$(json_get "$WORK/cfg" end)"
+            printf '1\t0\tkeep_on: never off\n' >> "$RULES"
+            { json_get "$WORK/cfg" keep_on_group; json_list "$WORK/cfg" keep_on_group; } | grep -v '^$' \
+                | while IFS= read -r _v; do printf '1\tgroup\t%s\n' "$_v"; done >> "$RMATCH"
+            json_list "$WORK/cfg" keep_on | while IFS= read -r _v; do [ -n "$_v" ] && printf '1\tap\t%s\n' "$_v"; done >> "$RMATCH"
         else
-            REASON="outside night window $START_RAW-$END_RAW, now $NOW_RAW"
+            FAILSAFE="config has no \"default\" or \"groups\""
         fi
     fi
 fi
@@ -448,7 +485,7 @@ if [ "$LIST_ONLY" = 1 ]; then
     echo "$AP_COUNT access point(s)"
     if fetch_groups; then
         echo
-        echo "AP groups (use the name in \"keep_on_group\"):"
+        echo "AP groups (use these names in \"group\"):"
         while IFS="$(printf '\t')" read -r gname gmacs; do
             _members=""
             for _m in $gmacs; do
@@ -467,59 +504,71 @@ if [ "$AP_COUNT" -eq 0 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 3) Matching helpers (name case-insensitive, or MAC with : or -)
+# 3) Resolve groups to MACs and work out the wanted state of every AP
 # ---------------------------------------------------------------------------
-matches_list() {
-    # $1 list (newline separated), $2 mac, $3 name
-    _mac=$(norm_mac "$2"); _name=$(lower "$3")
-    printf '%s\n' "$1" | while IFS= read -r _e; do
-        [ -z "$_e" ] && continue
-        _el=$(lower "$_e")
-        if [ "$_el" = "$_name" ] || [ "$(norm_mac "$_e")" = "$_mac" ]; then echo yes; break; fi
-    done
-}
-
-# Resolve keep_on_group names into MACs and add them to KEEP_LIST. If a named
-# group can't be read or found, nothing is turned off (fail-safe).
-if [ "$NIGHT" = 1 ] && [ -n "$KEEP_GROUPS" ]; then
-    if ! fetch_groups; then
-        NIGHT=0; REASON="AP groups unavailable -> fail-safe: all APs on"
-    else
-        _nl='
-'
-        _missing=""
-        while IFS= read -r _g; do
-            _gm=$(awk -F '\t' -v g="$(lower "$_g")" 'tolower($1) == g { print $2; exit }' "$WORK/groups")
-            if ! awk -F '\t' -v g="$(lower "$_g")" 'tolower($1) == g { f = 1 } END { exit !f }' "$WORK/groups"; then
-                _missing="$_missing${_missing:+, }$_g"
-                continue
-            fi
-            for _m in $_gm; do KEEP_LIST="$KEEP_LIST${KEEP_LIST:+$_nl}$_m"; done
-        done <<EOF_GROUPS
-$KEEP_GROUPS
-EOF_GROUPS
-        if [ -n "$_missing" ]; then
-            log ERROR "AP group(s) not found: $_missing -> not turning anything off (run --list to see group names)"
-            NIGHT=0; REASON="keep_on_group not found"
+# $WORK/matchers: rule-no<TAB>lowercase MAC or AP name
+: > "$WORK/matchers"
+if [ -z "$FAILSAFE" ] && [ "$DISABLED" = 0 ]; then
+    awk -F '\t' '$2 == "ap" { v = tolower($3); if (v ~ /^([0-9a-f][0-9a-f][-:]){5}[0-9a-f][0-9a-f]$/) gsub(/-/, ":", v); print $1 "\t" v }' "$RMATCH" >> "$WORK/matchers"
+    if grep -q "	group	" "$RMATCH"; then
+        if ! fetch_groups; then
+            FAILSAFE="AP groups could not be read"
+        else
+            _missing=$(awk -F '\t' '
+                FILENAME == gf { g[tolower($1)] = $2; next }
+                $2 == "group" {
+                    k = tolower($3)
+                    if (!(k in g)) { miss = miss (miss == "" ? "" : ", ") $3; next }
+                    n = split(g[k], m, " ")
+                    for (j = 1; j <= n; j++) print $1 "\t" m[j] >> out
+                }
+                END { print miss }' out="$WORK/matchers" gf="$WORK/groups" "$WORK/groups" "$RMATCH")
+            [ -n "$_missing" ] && FAILSAFE="AP group(s) not found: $_missing (run --list to see group names)"
         fi
     fi
 fi
+printf '%s\n' "$IGNORE_LIST" | awk 'NF { v = tolower($0); gsub(/-/, ":", v); print v; print tolower($0) }' > "$WORK/ignore"
 
-# Safety: at night, at least one keep_on AP must exist and be online.
-if [ "$NIGHT" = 1 ]; then
-    KEEP_FOUND=0; KEEP_ONLINE=0
-    while IFS="$(printf '\t')" read -r id mac dis st name; do
-        if [ -n "$(matches_list "$KEEP_LIST" "$mac" "$name")" ]; then
-            KEEP_FOUND=$((KEEP_FOUND + 1))
-            [ "$dis" = "false" ] && [ "$st" = "1" ] && KEEP_ONLINE=$((KEEP_ONLINE + 1))
-        fi
-    done < "$WORK/aps"
-    if [ "$KEEP_FOUND" -eq 0 ]; then
-        log ERROR "None of keep_on/keep_on_group ($(printf '%s' "$KEEP_LIST" | tr '\n' ',')) matches an AP name or MAC -> not turning anything off"
-        NIGHT=0; REASON="keep_on matched no AP"
-    fi
-    KEEP_WAIT=0
-    [ "$NIGHT" = 1 ] && [ "$KEEP_ONLINE" -eq 0 ] && KEEP_WAIT=1
+# plan: id<TAB>mac<TAB>disabled<TAB>state<TAB>name<TAB>want(on|off|skip)<TAB>note
+plan() {
+    awk -F '\t' -v failsafe="$1" '
+        FILENAME == ARGV[1] { act[$1] = $2; desc[$1] = $3; next }
+        FILENAME == ARGV[2] { mt[$2] = mt[$2] " " $1; next }
+        FILENAME == ARGV[3] { ign[$0] = 1; next }
+        {
+            mac = $2; nm = tolower($5)
+            if ((mac in ign) || (nm in ign)) { print $0 "\tskip\tignored"; next }
+            if (failsafe != "") { print $0 "\ton\t"; next }
+            # rules this AP belongs to (by MAC, or by name for "aps" entries)
+            list = mt[mac] " " mt[nm]; n = split(list, r, " ")
+            delete seen; cnt = 0; off = 1; names = ""
+            for (j = 1; j <= n; j++) {
+                if (r[j] in seen) continue
+                seen[r[j]] = 1; cnt++
+                if (act[r[j]] != 1) off = 0
+                d = desc[r[j]]; sub(/:.*/, "", d); names = names (names == "" ? "" : ", ") d
+            }
+            if (cnt == 0) { off = (act[0] == 1); note = "default" }
+            else if (cnt == 1) note = names
+            else note = "in " cnt " groups (" names "), longest on-time wins"
+            print $0 "\t" (off ? "off" : "on") "\t" note
+        }' "$RULES" "$WORK/matchers" "$WORK/ignore" "$WORK/aps"
+}
+
+plan "$FAILSAFE$( [ "$DISABLED" = 1 ] && echo disabled)" > "$WORK/plan"
+
+# Safety: never turn off every AP; and only turn APs off while at least one
+# AP that should stay on is actually online.
+WANT_OFF=$(awk -F '\t' '$6 == "off"' "$WORK/plan" | wc -l | tr -d ' ')
+WANT_ON=$(awk -F '\t' '$6 == "on"' "$WORK/plan" | wc -l | tr -d ' ')
+ON_ONLINE=$(awk -F '\t' '$6 != "off" && $3 == "false" && $4 == "1"' "$WORK/plan" | wc -l | tr -d ' ')
+if [ -z "$FAILSAFE" ] && [ "$WANT_OFF" -gt 0 ] && [ "$WANT_ON" -eq 0 ]; then
+    FAILSAFE="the schedule would turn off every AP right now"
+fi
+if [ -n "$FAILSAFE" ]; then
+    log WARN "$FAILSAFE -> fail-safe: all APs on"
+    plan "$FAILSAFE" > "$WORK/plan"
+    WANT_OFF=0
 fi
 
 # ---------------------------------------------------------------------------
@@ -544,38 +593,37 @@ set_disabled() {
 }
 
 CHANGES=0; FAILS=0
-TAB="$(printf '\t')"
 
-# Pass 1: enable everything that should be on (keep_on APs first, so they are
-# up before others go dark).
-while IFS="$TAB" read -r id mac dis st name; do
-    [ -n "$(matches_list "$IGNORE_LIST" "$mac" "$name")" ] && continue
-    want=false
-    if [ "$NIGHT" = 1 ] && [ -z "$(matches_list "$KEEP_LIST" "$mac" "$name")" ]; then want=true; fi
-    if [ "$want" = false ] && [ "$dis" = true ]; then
-        set_disabled "$id" false "$name ($mac)"
-    fi
-done < "$WORK/aps"
+# Pass 1: turn on everything that should be on, before anything goes dark.
+while IFS="$TAB" read -r id mac dis st name want note; do
+    [ "$want" = on ] && [ "$dis" = true ] && set_disabled "$id" false "$name ($mac)${note:+ [$note]}"
+done < "$WORK/plan"
 
-# Pass 2: disable the rest (only if a keep_on AP is actually online).
-if [ "$NIGHT" = 1 ]; then
-    if [ "${KEEP_WAIT:-0}" = 1 ]; then
-        log WARN "no keep_on AP is online yet -> waiting before turning others off (next run will retry)"
+# Pass 2: turn off the rest, but only once an AP that stays on is online.
+if [ "$WANT_OFF" -gt 0 ]; then
+    if [ "$ON_ONLINE" -eq 0 ]; then
+        log WARN "no AP that should stay on is online yet -> waiting before turning others off (next run will retry)"
     else
-        while IFS="$TAB" read -r id mac dis st name; do
-            [ -n "$(matches_list "$IGNORE_LIST" "$mac" "$name")" ] && continue
-            [ -n "$(matches_list "$KEEP_LIST" "$mac" "$name")" ] && continue
-            [ "$dis" = false ] && set_disabled "$id" true "$name ($mac)"
-        done < "$WORK/aps"
+        while IFS="$TAB" read -r id mac dis st name want note; do
+            [ "$want" = off ] && [ "$dis" = false ] && set_disabled "$id" true "$name ($mac)${note:+ [$note]}"
+        done < "$WORK/plan"
     fi
 fi
 
-MODE=day; [ "$NIGHT" = 1 ] && MODE=night
+if [ "$DISABLED" = 1 ]; then
+    SUMMARY="NightMode disabled in config"
+elif [ -n "$FAILSAFE" ]; then
+    SUMMARY="fail-safe: $FAILSAFE"
+else
+    SUMMARY="now $NOW_RAW, $(awk -F '\t' '{ printf "%s%s%s", (NR > 1 ? "; " : ""), $3, ($2 == 1 ? " (active)" : "") }' "$RULES")"
+fi
+WANT_OFF_NOW=$(awk -F '\t' '$6 == "off"' "$WORK/plan" | wc -l | tr -d ' ')
+COUNTS="$WANT_OFF_NOW of $AP_COUNT APs scheduled off"
 if [ "$CHANGES" -gt 0 ] || [ "$FAILS" -gt 0 ]; then
-    log INFO "mode=$MODE ($REASON): $CHANGES change(s), $FAILS failure(s), $AP_COUNT APs"
+    log INFO "$SUMMARY: $COUNTS, $CHANGES change(s), $FAILS failure(s)"
 else
     # one quiet line per run so you can see the job is alive
-    log OK "mode=$MODE ($REASON): nothing to change, $AP_COUNT APs"
+    log OK "$SUMMARY: $COUNTS, nothing to change"
 fi
 trim_log
 [ "$FAILS" -eq 0 ]

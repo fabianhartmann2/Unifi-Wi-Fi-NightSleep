@@ -1,6 +1,6 @@
 # NightMode: Synology setup
 
-NightMode turns off every UniFi access point except the members of one AP Group (`keep_on_group`) during the night window, and turns them all back on afterwards. The DSM Task Scheduler runs it every 15 minutes. Each run checks the real state and changes only what is wrong. This means edits to the shared JSON take effect within 15 minutes, and a missed run fixes itself on the next one.
+NightMode turns UniFi access points off and on by schedule, with a separate "off" window for each UniFi AP Group. For example, most APs are off 19:00 to 08:00, the evening group 22:00 to 06:00, and the night group is never off. The DSM Task Scheduler runs it every 15 minutes. Each run checks the real state and changes only what is wrong. This means edits to the shared JSON take effect within 15 minutes, and a missed run fixes itself on the next one.
 
 ## Files
 
@@ -15,21 +15,47 @@ NightMode turns off every UniFi access point except the members of one AP Group 
 ```json
 {
   "enabled": true,
-  "start": "23:00",
-  "end": "06:00",
-  "keep_on_group": "NightMode",
-  "keep_on": [],
+  "default": { "off_from": "19:00", "off_until": "08:00" },
+  "groups": [
+    { "group": "Evening", "off_from": "22:00", "off_until": "06:00" },
+    { "group": "Night", "off": "never" }
+  ],
   "ignore": []
 }
 ```
 
-- `enabled`: `true` or `false`. Setting it to `false` turns all APs back on at the next run.
-- `start` / `end`: 24 hour local time of the NAS, `"HH:MM"` or just the hour (`23`). The window can cross midnight. It starts at `start` and ends at `end`, so 23:00 to 06:00 means the APs come back at the 06:00 run.
-- `keep_on_group`: name of the UniFi AP Group whose APs all stay on at night (not case sensitive). Create the group in UniFi Network under Settings > WiFi > AP Groups (the exact menu depends on the version). It can also be a list, e.g. `["NightMode", "Keller"]`. To change which APs stay on, just change the group's members in UniFi. The JSON doesn't need to change.
-- `keep_on`: optional extra AP names (as shown in UniFi, not case sensitive) or MAC addresses that stay on in addition to the group. Leave it as `[]` if you only use the group.
-- `ignore`: APs the script never touches, e.g. one you disabled by hand for maintenance. Without this, the next daytime run would switch it back on.
+With this file the day looks like this:
 
-Fail-safes: if the file is missing or not valid JSON, has an invalid time, names an AP group that doesn't exist (or can't be read), or the group and `keep_on` together match no AP, the script turns everything **on** and writes the reason to the log. At night it only turns the others off once at least one of the APs that stay on is actually online.
+| Time | On | Off |
+|---|---|---|
+| 08:00 to 19:00 | all APs | none |
+| 19:00 to 22:00 | Evening and Night groups | all other APs |
+| 22:00 to 06:00 | Night group | everything else |
+| 06:00 to 08:00 | Evening and Night groups | all other APs |
+
+- `enabled`: `true` or `false`. Setting it to `false` turns all APs back on at the next run.
+- `default`: when the APs that are in **none** of the listed groups are off. Use `"off": "never"` to leave them alone.
+- `groups`: one entry per UniFi AP Group, with the time its APs are off:
+  - `group`: the AP Group's name in UniFi (not case sensitive). Create groups in UniFi Network under Settings > WiFi > AP Groups (the exact menu depends on the version). Run `--list` to see the exact names.
+  - `off_from` / `off_until`: 24 hour local time of the NAS, `"HH:MM"` or just the hour (`22`). The window can cross midnight. It ends at `off_until`, so a group off until 06:00 comes back at the 06:00 run.
+  - `"off": "never"` keeps the group on all the time. `"off": "always"` keeps it off all the time.
+  - Instead of `group`, an entry can list single APs by name or MAC: `{ "aps": ["AP-Keller"], "off": "never" }`.
+  - You can add as many entries as you like, for example a third phase.
+- `ignore`: APs the script never touches, e.g. one you disabled by hand for maintenance. Without this, the next run would switch it back to its schedule.
+
+**APs in more than one group:** an AP that is in two of the listed groups is only off when **all** of its groups are off, so the group that keeps it on longest wins. The log notes this whenever such an AP is switched. To keep things clear, it's best to put each AP in only one of the listed groups. Also leave UniFi's built-in "All APs" group out of the list, because it contains every AP.
+
+To change which APs belong to which phase, just change the group members in UniFi. The JSON doesn't need to change.
+
+**Fail-safes:** the script turns everything **on** and writes the reason to the log if:
+- the file is missing or not valid JSON,
+- a time is invalid,
+- a group name doesn't exist (or the groups can't be read),
+- or the schedule would turn off every AP at once.
+
+It also only turns APs off once at least one of the APs that should stay on is actually online.
+
+The older format (`start`, `end`, `keep_on_group`, `keep_on`) still works. It means: default off from `start` to `end`, and the `keep_on_group` and `keep_on` APs are never off.
 
 ## 1. Create a dedicated UniFi account
 
@@ -61,13 +87,13 @@ Over SSH (as root), or as a one-off task with "Send run details by email" turned
 sh /volume1/homes/admin/nightmode/nightmode.sh -c /volume1/homes/admin/nightmode/nightmode.conf --list
 ```
 
-This logs in and prints all APs with name, MAC and state, followed by all AP groups and their members, without changing anything. Check that your night group shows the right APs, and put its name into `keep_on_group`. Then do a dry run, which shows what it would switch right now:
+This logs in and prints all APs with name, MAC and state, followed by all AP groups and their members, without changing anything. Check that your groups contain the right APs, and use their exact names in `groups`. Then do a dry run, which shows what it would switch right now:
 
 ```sh
 sh /volume1/homes/admin/nightmode/nightmode.sh -c /volume1/homes/admin/nightmode/nightmode.conf --dry-run
 ```
 
-To test the night behaviour during the day, use `NIGHTMODE_NOW=23:30 sh ... --dry-run`.
+To test another time of day, use e.g. `NIGHTMODE_NOW=20:30 sh ... --dry-run` (evening) or `NIGHTMODE_NOW=23:30 sh ... --dry-run` (night).
 
 If something fails, add `--debug`. It prints the HTTP status of each request and the start of the controller's response to the terminal, not to the log. Passwords, keys and tokens are replaced by `***`, and the login response isn't shown at all. Look over the output before sending it to anyone: it still contains device names, MACs and IP addresses.
 
@@ -88,9 +114,9 @@ Control Panel > Task Scheduler > Create > Scheduled Task > User-defined script:
 Each run writes one line, e.g.
 
 ```
-2026-11-27 23:00:04 [INFO] turned OFF AP-Keller (aa:bb:cc:00:00:0e)
-2026-11-27 23:00:05 [INFO] mode=night (night window 23:00-06:00, now 23:00): 16 change(s), 0 failure(s), 17 APs
-2026-11-27 23:15:03 [OK] mode=night (night window 23:00-06:00, now 23:15): nothing to change, 17 APs
+2026-11-27 22:00:04 [INFO] turned OFF AP-Kueche (aa:bb:cc:00:00:0e) [Evening]
+2026-11-27 22:00:05 [INFO] now 22:00, default: off 19:00-08:00 (active); Evening: off 22:00-06:00 (active); Night: never off: 16 of 17 APs scheduled off, 3 change(s), 0 failure(s)
+2026-11-27 22:15:03 [OK] now 22:15, default: off 19:00-08:00 (active); Evening: off 22:00-06:00 (active); Night: never off: 16 of 17 APs scheduled off, nothing to change
 ```
 
 It is trimmed to the last 2000 lines (about 3 weeks).
