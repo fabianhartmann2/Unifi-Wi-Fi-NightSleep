@@ -11,12 +11,14 @@
 # state differs. Needs only: sh, curl, awk, sed, grep (no jq, no python).
 #
 # Usage:
-#   nightmode.sh [-c local.conf] [--dry-run] [--list]
+#   nightmode.sh [-c local.conf] [--dry-run] [--list] [--debug]
 #     -c FILE     local settings/credentials file (default: nightmode.conf
 #                 next to this script)
 #     --dry-run   show what would change, change nothing
 #     --list      print all APs (name, MAC, state) and exit; use this to fill
 #                 in "keep_on" in the shared JSON
+#     --debug     print HTTP status and the start of each controller response
+#                 to the terminal (passwords, keys and tokens are redacted)
 #
 # Testing hook: NIGHTMODE_NOW=HH:MM overrides the current time.
 # =============================================================================
@@ -28,6 +30,7 @@ export LC_ALL=C
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 LOCAL_CONF="$SCRIPT_DIR/nightmode.conf"
 DRY_RUN=0
+DEBUG=0
 LIST_ONLY=0
 
 while [ $# -gt 0 ]; do
@@ -35,6 +38,7 @@ while [ $# -gt 0 ]; do
         -c) LOCAL_CONF="$2"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         --list) LIST_ONLY=1; shift ;;
+        --debug) DEBUG=1; shift ;;
         -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 2 ;;
     esac
@@ -199,6 +203,26 @@ json_get() { awk -F '\t' -v p="$2" '$1 == p { print substr($0, length($1) + 2); 
 # json_list FLATFILE PREFIX -> values of PREFIX.0, PREFIX.1, ...
 json_list() { awk -F '\t' -v p="$2" 'index($1, p ".") == 1 && substr($1, length(p) + 2) ~ /^[0-9]+$/ { print substr($0, length($1) + 2) }' "$1"; }
 
+# debug_resp LABEL CODE: show status, headers of interest and a redacted preview
+debug_resp() {
+    [ "$DEBUG" = 1 ] || return 0
+    {
+        echo "----- DEBUG $1: HTTP $2"
+        grep -i -E '^(content-type|content-length|location):' "$WORK/hdr" 2>/dev/null | tr -d '\r' | sed 's/^/  /'
+        echo "  csrf token received: $([ -n "$CSRF" ] && echo yes || echo no)"
+        echo "  body bytes: $(wc -c < "$WORK/resp" 2>/dev/null | tr -d ' ')"
+        if [ "${3:-}" = nobody ]; then echo "  (body not shown)"; echo; return 0; fi
+        echo "  body start (redacted):"
+        head -c 800 "$WORK/resp" 2>/dev/null | tr -d '\r' | redact | fold -w 160 | sed 's/^/    /'
+        echo
+    } >&2
+}
+
+# redact secrets in JSON text: any key containing pass, key, token, secret, psk
+redact() {
+    sed -E 's/"([A-Za-z0-9_]*([Pp]ass|[Kk]ey|[Tt]oken|[Ss]ecret|psk)[A-Za-z0-9_]*)"[[:space:]]*:[[:space:]]*"[^"]*"/"\1":"***"/g'
+}
+
 json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 
 lower() { printf '%s' "$1" | tr 'A-Z' 'a-z'; }
@@ -238,12 +262,13 @@ login() {
     : > "$WORK/cookies"
     _code=$(curl_api POST "$BASE/api/auth/login" "$WORK/login.json")
     rm -f "$WORK/login.json"
+    update_csrf
+    debug_resp login "$_code" nobody
     if [ "$_code" != "200" ]; then
         log ERROR "Login to $UNIFI_HOST failed (HTTP $_code). Check user/password; the account must be a local account without 2FA."
         return 1
     fi
     LOGGED_IN=1
-    update_csrf
     return 0
 }
 
@@ -333,13 +358,31 @@ fi
 login || exit 1
 
 CODE=$(curl_api GET "$API/stat/device" "")
+debug_resp "stat/device ($API/stat/device)" "$CODE"
 if [ "$CODE" != "200" ]; then
     log ERROR "Reading device list failed (HTTP $CODE)"
     exit 1
 fi
-json_flat < "$WORK/resp" > "$WORK/dev" 2>/dev/null
-if grep -q '^__error__' "$WORK/dev" || [ "$(json_get "$WORK/dev" meta.rc)" != "ok" ]; then
-    log ERROR "Unexpected device list response from controller"
+json_flat < "$WORK/resp" > "$WORK/dev" 2>"$WORK/awkerr"
+if [ "$DEBUG" = 1 ]; then
+    {
+        echo "----- DEBUG parsed device list: $(wc -l < "$WORK/dev" | tr -d ' ') values, awk: $(awk --version 2>&1 | head -n 1)"
+        [ -s "$WORK/awkerr" ] && sed 's/^/  awk stderr: /' "$WORK/awkerr"
+        grep -E '^(__error__|meta\.)' "$WORK/dev" | sed 's/^/  /'
+        grep -E '^data\.0\.(type|model|name|state|disabled)	' "$WORK/dev" | sed 's/^/  /'
+    } >&2
+fi
+if grep -q '^__error__' "$WORK/dev"; then
+    log ERROR "Could not parse device list ($(grep '^__error__' "$WORK/dev" | cut -f2)). Run with --debug and send the output."
+    exit 1
+fi
+if [ ! -s "$WORK/dev" ] && [ -s "$WORK/awkerr" ]; then
+    log ERROR "JSON parser failed: $(head -n 1 "$WORK/awkerr"). Run with --debug and send the output."
+    exit 1
+fi
+RC=$(json_get "$WORK/dev" meta.rc)
+if [ "$RC" != "ok" ]; then
+    log ERROR "Unexpected device list response from controller (meta.rc=\"$RC\" msg=\"$(json_get "$WORK/dev" meta.msg)\"). Run with --debug and send the output."
     exit 1
 fi
 
@@ -372,6 +415,7 @@ AP_COUNT=$(wc -l < "$WORK/aps" | tr -d ' ')
 # Writes $WORK/groups: name<TAB>mac mac mac...
 fetch_groups() {
     _code=$(curl_api GET "$BASE/proxy/network/v2/api/site/$UNIFI_SITE/apgroups" "")
+    debug_resp apgroups "$_code"
     if [ "$_code" != "200" ]; then
         log ERROR "Reading AP groups failed (HTTP $_code). AP groups need UniFi Network 8 or newer."
         return 1

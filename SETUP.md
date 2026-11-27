@@ -69,6 +69,8 @@ sh /volume1/homes/admin/nightmode/nightmode.sh -c /volume1/homes/admin/nightmode
 
 To test the night behaviour during the day, use `NIGHTMODE_NOW=23:30 sh ... --dry-run`.
 
+If something fails, add `--debug`. It prints the HTTP status of each request and the start of the controller's response to the terminal, not to the log. Passwords, keys and tokens are replaced by `***`, and the login response isn't shown at all. Look over the output before sending it to anyone: it still contains device names, MACs and IP addresses.
+
 ## 4. Schedule it
 
 Control Panel > Task Scheduler > Create > Scheduled Task > User-defined script:
